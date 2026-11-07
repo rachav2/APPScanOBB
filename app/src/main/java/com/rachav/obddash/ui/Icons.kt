@@ -113,17 +113,17 @@ fun ObdIcon(kind: Ico, modifier: Modifier = Modifier.size(24.dp), color: Color =
             Ico.Wind -> {
                 val p1 = Path().apply {
                     moveTo(0.10f * s, 0.34f * s); lineTo(0.58f * s, 0.34f * s)
-                    quadTo(0.84f * s, 0.34f * s, 0.84f * s, 0.20f * s)
-                    quadTo(0.84f * s, 0.10f * s, 0.72f * s, 0.10f * s)
+                    quadraticTo(0.84f * s, 0.34f * s, 0.84f * s, 0.20f * s)
+                    quadraticTo(0.84f * s, 0.10f * s, 0.72f * s, 0.10f * s)
                 }
                 val p2 = Path().apply {
                     moveTo(0.10f * s, 0.54f * s); lineTo(0.84f * s, 0.54f * s)
-                    quadTo(0.95f * s, 0.54f * s, 0.95f * s, 0.66f * s)
-                    quadTo(0.95f * s, 0.76f * s, 0.84f * s, 0.76f * s)
+                    quadraticTo(0.95f * s, 0.54f * s, 0.95f * s, 0.66f * s)
+                    quadraticTo(0.95f * s, 0.76f * s, 0.84f * s, 0.76f * s)
                 }
                 val p3 = Path().apply {
                     moveTo(0.10f * s, 0.74f * s); lineTo(0.50f * s, 0.74f * s)
-                    quadTo(0.70f * s, 0.74f * s, 0.70f * s, 0.86f * s)
+                    quadraticTo(0.70f * s, 0.74f * s, 0.70f * s, 0.86f * s)
                 }
                 drawPath(path = p1, color = color, style = st)
                 drawPath(path = p2, color = color, style = st)
