@@ -43,3 +43,9 @@ App Android (Kotlin + Jetpack Compose) para adaptadores **ELM327 Bluetooth clás
 - Los códigos `P1xxx`, `B`, `C` y la mayoría de los `U` son del fabricante; la base local trae los genéricos más comunes y unos pocos de Honda. Los que no conoce se muestran con una explicación general.
 - La lectura de códigos prueba los dos formatos de respuesta más comunes (con y sin byte de conteo en CAN).
 - Archivos: `obd/Elm327.kt` (protocolo), `obd/DtcDatabase.kt` (significados), `obd/Fuel.kt` (consumo), `ui/Gauges.kt` (dial y tarjetas), `ui/Icons.kt` (iconos), `ui/Screens.kt` (pantallas).
+
+## Compilar con GitHub Actions
+
+El workflow `.github/workflows/build.yml` compila el APK en cada push a `main`, en pull requests y a mano
+(pestaña **Actions → Build APK → Run workflow**). El APK queda en los *Artifacts* de la ejecución como
+`ObdDash-debug-apk`. Si subes un tag que empiece con `v` (por ejemplo `v1.0`), además se publica en *Releases*.
