@@ -30,6 +30,12 @@ data class ObdData(
     val catalyst: Int? = null,
 )
 
+/** Cuadro congelado: código que lo disparó y valores guardados (clave de PID -> valor). */
+data class FreezeFrame(val code: String, val values: Map<String, Double>)
+
+/** Resultado de preguntar a un módulo (exploración experimental). */
+data class ModuleResult(val header: String, val name: String, val codes: List<String>, val responded: Boolean)
+
 /** Estado de la ECU (PID 0101): luz MIL y monitores de emisiones listos. */
 data class EcuStatus(val mil: Boolean, val monitorsReady: Int, val monitorsTotal: Int)
 
@@ -280,17 +286,92 @@ class Elm327 {
         )
     }
 
+    // ------------------------------------------------------------------ fase 1: errores y cuadro congelado
+
+    /** Concatena una respuesta multitrama CAN ("0:..", "1:..") o devuelve las líneas tal cual. */
+    private fun joinFrames(raw: List<String>): List<String> {
+        val indexed = Regex("^[0-9A-F]:")
+        return if (raw.any { indexed.containsMatchIn(it) }) {
+            listOf(raw.filter { indexed.containsMatchIn(it) }.joinToString("") { it.substring(2) })
+        } else {
+            raw
+        }
+    }
+
+    /** Códigos permanentes (modo 0A): no se borran con un escáner. */
+    suspend fun readPermanentDtcs(): List<String> = readDtcs("0A", "4A")
+
+    /** Lee un dato del cuadro congelado (modo 02, cuadro 00). [pid] son 2 dígitos, ej. "0C". */
+    private suspend fun readFrozen(pid: String): IntArray? {
+        val prefix = "42" + pid + "00"
+        for (line in joinFrames(lines(send("02" + pid + "00", 3000L)))) {
+            if (line.startsWith(prefix)) {
+                val bytes = line.substring(prefix.length).chunked(2).filter { it.length == 2 }.mapNotNull { it.toIntOrNull(16) }
+                return if (bytes.isEmpty()) null else bytes.toIntArray()
+            }
+        }
+        return null
+    }
+
+    /**
+     * Cuadro congelado: el código que lo disparó (02 02) y las variables guardadas.
+     * Devuelve null si la ECU no tiene ninguno guardado.
+     */
+    suspend fun readFreezeFrame(keys: List<String>): FreezeFrame? {
+        val c = readFrozen("02") ?: return null
+        if (c.size < 2) return null
+        val code = decodeDtcHex("%02X%02X".format(c[0], c[1])) ?: return null
+        if (code == "P0000") return null
+        val values = LinkedHashMap<String, Double>()
+        for (key in keys) {
+            val bytes = readFrozen(key.substring(2)) ?: continue
+            Pids.decode(key, bytes)?.let { values[key] = it }
+        }
+        return FreezeFrame(code, values)
+    }
+
+    /** Monitores I/M por nombre: 0101 (desde el borrado) y 0141 (este ciclo de manejo, si existe). */
+    suspend fun readMonitors(): List<MonitorRow> {
+        val b101 = readPid("0101") ?: return emptyList()
+        val b141 = readPid("0141")
+        return Monitors.decode(b101, b141)
+    }
+
+    /**
+     * EXPERIMENTAL. Pregunta por códigos a otros módulos con UDS 0x19 sobre CAN de 11 bits.
+     * Las direcciones cambian de marca en marca; si un módulo no contesta, no es un error.
+     */
+    suspend fun scanModules(candidates: List<Pair<String, String>>): List<ModuleResult> {
+        val results = mutableListOf<ModuleResult>()
+        try {
+            send("ATH0")
+            for ((header, label) in candidates) {
+                send("ATSH$header")
+                val raw = joinFrames(lines(send("1902AC", 3000L)))
+                val resp = raw.firstOrNull { it.startsWith("5902") }
+                if (resp == null) {
+                    results.add(ModuleResult(header, label, emptyList(), false))
+                    continue
+                }
+                // 5902 + máscara de disponibilidad (1 byte) + registros de 4 bytes (código de 2 bytes, falla, estado).
+                val body = resp.removePrefix("5902").drop(2)
+                val codes = body.chunked(8).filter { it.length == 8 }
+                    .mapNotNull { decodeDtcHex(it.substring(0, 4)) }
+                    .filter { it != "P0000" }
+                results.add(ModuleResult(header, label, codes, true))
+            }
+        } finally {
+            runCatching { send("ATSH7DF") }
+        }
+        return results
+    }
+
     /** Borra códigos y apaga la luz MIL (modo 04). */
     suspend fun clearDtcs(): Boolean = lines(send("04", 5000L)).any { it.startsWith("44") }
 
     // ---------------------------------------------------------------------------------------
 
-    private fun decodeDtc(hex: String): String? {
-        val v = hex.toIntOrNull(16) ?: return null
-        val letter = "PCBU"[(v shr 14) and 3]
-        val digit = (v shr 12) and 3
-        return "$letter$digit${"%03X".format(v and 0xFFF)}"
-    }
+    private fun decodeDtc(hex: String): String? = decodeDtcHex(hex)
 
     private fun lines(raw: String): List<String> =
         raw.split('\r', '\n')

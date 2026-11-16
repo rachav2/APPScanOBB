@@ -5,15 +5,35 @@ import android.app.Application
 import android.bluetooth.BluetoothDevice
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.rachav.obddash.alerts.AlertNotifier
+import com.rachav.obddash.alerts.MonitorService
+import com.rachav.obddash.data.AlertOp
+import com.rachav.obddash.data.AlertRule
+import com.rachav.obddash.data.AlertRuleStore
+import com.rachav.obddash.data.AppPrefs
+import com.rachav.obddash.data.BatteryRecord
+import com.rachav.obddash.data.BatteryStore
+import com.rachav.obddash.data.DtcHistoryStore
+import com.rachav.obddash.data.DtcRecord
+import com.rachav.obddash.data.FillUp
+import com.rachav.obddash.data.FillUpStore
 import com.rachav.obddash.data.ProfileStore
 import com.rachav.obddash.data.VehicleProfile
+import com.rachav.obddash.obd.BatteryReadings
+import com.rachav.obddash.obd.BatteryEval
 import com.rachav.obddash.obd.CompatReport
 import com.rachav.obddash.obd.DtcDatabase
 import com.rachav.obddash.obd.DtcInfo
 import com.rachav.obddash.obd.Elm327
+import com.rachav.obddash.obd.FreezeFrame
 import com.rachav.obddash.obd.FuelModel
 import com.rachav.obddash.obd.ModeSupport
+import com.rachav.obddash.obd.ModuleResult
+import com.rachav.obddash.obd.MonitorRow
+import com.rachav.obddash.obd.MonState
 import com.rachav.obddash.obd.ObdData
+import com.rachav.obddash.obd.Pids
+import com.rachav.obddash.obd.TripMath
 import com.rachav.obddash.obd.withPid
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -24,6 +44,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sin
@@ -83,11 +104,44 @@ data class UiState(
     val profile: VehicleProfile = VehicleProfile.civicDefault(),
     val compat: CompatReport? = null,
     val compatBusy: Boolean = false,
+    /** PIDs de modo 01 que la ECU dice soportar (vacío = aún no se sabe). */
+    val supported: Set<String> = emptySet(),
+    /** Última lectura de cada variable extra (fuel trims, O2, MAP...). */
+    val live: Map<String, Double> = emptyMap(),
+    /** Historial reciente (hasta 5 min) de las variables vigiladas. */
+    val series: Map<String, List<Sample>> = emptyMap(),
+    val recording: Boolean = false,
+    val dtcRecords: List<DtcRecord> = emptyList(),
+    val freeze: FreezeFrame? = null,
+    val permanent: List<String> = emptyList(),
+    val modules: List<ModuleResult> = emptyList(),
+    val modulesBusy: Boolean = false,
+    val monitors: List<MonitorRow> = emptyList(),
+    val monitorsBusy: Boolean = false,
+    val batteryHistory: List<BatteryRecord> = emptyList(),
+    val fillups: List<FillUp> = emptyList(),
+    /** Km y litros estimados acumulados desde el último llenado completo. */
+    val fuelAcc: Pair<Double, Double> = 0.0 to 0.0,
+    val alertRules: List<AlertRule> = emptyList(),
+    val alertBanner: String? = null,
+    val backgroundAlerts: Boolean = false,
+    val autostart: Boolean = false,
+    val imTolerance: Int = 1,
+    /** VIN de un auto que no coincide con el perfil activo (para ofrecer crear otro perfil). */
+    val pendingVin: String? = null,
 )
+
+data class Sample(val t: Long, val v: Double)
 
 class ObdViewModel(app: Application) : AndroidViewModel(app) {
 
     private val store = ProfileStore(app)
+    private val prefs = AppPrefs(app)
+    private val dtcStore = DtcHistoryStore(app)
+    private val fillStore = FillUpStore(app)
+    private val batteryStore = BatteryStore(app)
+    private val alertStore = AlertRuleStore(app)
+    private val notifier = AlertNotifier(app)
 
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui
@@ -101,15 +155,64 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
     @Volatile
     private var paused = false
 
+    // Variables extra que piden las pantallas de herramientas (se leen además del panel, o en lugar de él).
+    @Volatile
+    private var watched: Set<String> = emptySet()
+    @Volatile
+    private var exclusive = false
+    @Volatile
+    private var alertKeys: Set<String> = emptySet()
+    private val liveMap = HashMap<String, Double>()
+    private val buffers = HashMap<String, ArrayDeque<Sample>>()
+    private val csv = StringBuilder()
+    private val since = HashMap<String, Long>()
+    private val lastFired = HashMap<String, Long>()
+    private var accKm = 0.0
+    private var accEst = 0.0
+    private var accSaved = 0L
+
     init {
+        DtcDatabase.init(app)
         val list = store.all()
         val active = list.firstOrNull { it.id == store.activeId() } ?: list.first()
         _ui.value = UiState(profiles = list, profile = active)
+        reloadProfileData()
     }
 
-    /** Estado limpio que conserva los perfiles cargados. */
-    private fun fresh(base: UiState = UiState()) =
-        base.copy(profiles = _ui.value.profiles, profile = _ui.value.profile)
+    /** Carga lo que se guarda por vehículo: historial de fallas, pruebas, tanqueos y reglas de alerta. */
+    private fun reloadProfileData() {
+        val p = _ui.value.profile
+        val acc = fillStore.accumulated(p.id)
+        accKm = acc.first
+        accEst = acc.second
+        val rules = alertStore.all(p.id, p.redlineRpm)
+        refreshAlertKeys(rules)
+        since.clear()
+        lastFired.clear()
+        _ui.update {
+            it.copy(
+                dtcRecords = dtcStore.all(p.id),
+                batteryHistory = batteryStore.all(p.id),
+                fillups = fillStore.all(p.id),
+                fuelAcc = acc,
+                alertRules = rules,
+                backgroundAlerts = prefs.backgroundAlerts,
+                autostart = prefs.autostart,
+                imTolerance = prefs.imTolerance,
+            )
+        }
+    }
+
+    /** Estado limpio que conserva los perfiles y los datos por vehículo. */
+    private fun fresh(base: UiState = UiState()): UiState {
+        val c = _ui.value
+        return base.copy(
+            profiles = c.profiles, profile = c.profile,
+            dtcRecords = c.dtcRecords, batteryHistory = c.batteryHistory, fillups = c.fillups,
+            fuelAcc = c.fuelAcc, alertRules = c.alertRules, backgroundAlerts = c.backgroundAlerts,
+            autostart = c.autostart, imTolerance = c.imTolerance,
+        )
+    }
 
     // ------------------------------------------------------------------ conexión real
 
@@ -145,7 +248,24 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 try {
                     e.connect(device)
                     e.initAdapter()
-                    val supported = e.supportedPids()
+                    val profile = _ui.value.profile
+                    val cached = prefs.pidCache(profile.id)
+                    // El VIN solo se pide si el perfil ya lo tiene (respuesta rápida) o si es la primera conexión.
+                    val vin = if (profile.vin != null || cached == null) runCatching { e.readVin() }.getOrNull() else null
+                    var pending: String? = null
+                    var supported = cached
+                    if (vin != null) {
+                        if (profile.vin == null) {
+                            saveVin(vin)
+                        } else if (!profile.vin.equals(vin, ignoreCase = true)) {
+                            pending = vin
+                            supported = null // otro auto: la caché no sirve
+                        }
+                    }
+                    if (supported == null) {
+                        supported = e.supportedPids()
+                        if (supported.isNotEmpty()) prefs.setPidCache(_ui.value.profile.id, supported)
+                    }
                     supportedPids = supported
                     elm = e
                     established = true
@@ -153,8 +273,12 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                     val adapter = e.version.takeIf { it.isNotBlank() }?.replace("ELM327V", "ELM327 v")
                     rememberAdapter(device, name)
                     _ui.update {
-                        it.copy(conn = ConnState.Connected, adapter = adapter, ecuId = e.ecuId, message = null)
+                        it.copy(
+                            conn = ConnState.Connected, adapter = adapter, ecuId = e.ecuId, message = null,
+                            supported = supported, pendingVin = pending ?: it.pendingVin,
+                        )
                     }
+                    if (prefs.backgroundAlerts) MonitorService.start(getApplication<Application>())
                     poll(e, supported)
                 } catch (ex: CancellationException) {
                     e.close()
@@ -204,12 +328,26 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         val slow = listOf("0105", "015C", "0104", "0111", "010F", "012F", "0146", "013C", "VOLT")
             .filter { it == "VOLT" || supported.isEmpty() || it in supported }
         var i = 0
+        var wi = 0
         var misses = 0
         var warned = false
         var last = System.nanoTime()
         while (currentCoroutineContext().isActive) {
             if (paused) {
                 delay(100)
+                last = System.nanoTime()
+                continue
+            }
+            val w = watched
+            if (exclusive && w.isNotEmpty()) {
+                // Modo gráfica/prueba: solo se consultan las variables elegidas, para subir la frecuencia de muestreo.
+                var sent = false
+                for (key in w.toList()) {
+                    if (paused || !currentCoroutineContext().isActive) break
+                    if (readExtra(e, key, supported)) sent = true
+                }
+                tickAlerts()
+                if (!sent) delay(100)
                 last = System.nanoTime()
                 continue
             }
@@ -228,11 +366,18 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 e.readPid(key)?.let { d = d.withPid(key, it) }
             }
 
+            val extra = (watched + alertKeys).toList()
+            if (extra.isNotEmpty()) readExtra(e, extra[wi++ % extra.size], supported)
+
             val now = System.nanoTime()
             val dt = ((now - last) / 1e9).coerceAtMost(2.0)
             last = now
-            val trip = _ui.value.trip.advance(dt, d.speed, d.rpm, FuelModel.fuelRateLph(d, _ui.value.profile.displacementL))
+            val raw = FuelModel.fuelRateLph(d, _ui.value.profile.displacementL)
+            val lh = raw?.let { it * _ui.value.profile.fuelCorrection }
+            val trip = _ui.value.trip.advance(dt, d.speed, d.rpm, lh)
+            accumulate(dt, d.speed, d.rpm, raw)
             _ui.update { it.copy(data = d, trip = trip) }
+            tickAlerts()
 
             if (rpm == null && spd == null) misses++ else {
                 misses = 0
@@ -244,6 +389,102 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                     it.copy(message = "El adaptador responde pero la ECU no. Enciende el contacto o el motor.")
                 }
             }
+        }
+    }
+
+    /** Lee una variable extra, la guarda en el buffer y la publica. Devuelve false si no se pidió nada al adaptador. */
+    private suspend fun readExtra(e: Elm327, key: String, supported: Set<String>): Boolean {
+        val v: Double? = if (key == "VOLT") {
+            e.readVoltage()?.toDouble()
+        } else {
+            if (supported.isNotEmpty() && key !in supported) return false
+            e.readPid(key)?.let { Pids.decode(key, it) }
+        }
+        if (v != null) recordSamples(mapOf(key to v))
+        return true
+    }
+
+    /** Guarda muestras nuevas: última lectura, buffer circular de 5 minutos y, si se graba, el CSV. */
+    private fun recordSamples(values: Map<String, Double>) {
+        val now = System.currentTimeMillis()
+        for ((key, v) in values) {
+            liveMap[key] = v
+            val buf = buffers.getOrPut(key) { ArrayDeque() }
+            buf.addLast(Sample(now, v))
+            while (buf.size > 3000 || (buf.isNotEmpty() && buf.first().t < now - 300_000L)) buf.removeFirst()
+            if (_ui.value.recording) csv.append(now).append(',').append(key).append(',').append(v).append('\n')
+        }
+        val w = watched
+        val snapshot = buffers.filterKeys { it in w }.mapValues { it.value.toList() }
+        _ui.update { it.copy(live = liveMap.toMap(), series = snapshot) }
+    }
+
+    /** Suma lo recorrido y lo estimado desde el último llenado; se guarda cada ~20 s. */
+    private fun accumulate(dt: Double, speed: Int?, rpm: Int?, rawLh: Double?) {
+        if ((rpm ?: 0) <= 0) return
+        accKm += (speed ?: 0) * dt / 3600.0
+        accEst += (rawLh ?: 0.0) * dt / 3600.0
+        val now = System.currentTimeMillis()
+        if (now - accSaved > 20_000L) {
+            accSaved = now
+            fillStore.setAccumulated(_ui.value.profile.id, accKm, accEst)
+            _ui.update { it.copy(fuelAcc = accKm to accEst) }
+        }
+    }
+
+    // ------------------------------------------------------------------ alertas
+
+    private fun refreshAlertKeys(rules: List<AlertRule>) {
+        val keys = mutableSetOf<String>()
+        for (r in rules.filter { it.enabled }) {
+            when (r.key) {
+                "TRIM" -> { keys.add("0106"); keys.add("0107") }
+                "0105", "VOLT", "FUEL", "010C" -> Unit // el panel ya las lee
+                else -> keys.add(r.key)
+            }
+        }
+        alertKeys = keys
+    }
+
+    private fun alertValue(r: AlertRule, s: UiState): Double? {
+        if (r.needsEngineOn && (s.data.rpm ?: 0) < 400) return null
+        return when (r.key) {
+            "0105" -> s.data.coolant?.toDouble()
+            "VOLT" -> s.data.voltage?.toDouble()
+            "FUEL" -> s.data.fuel?.toDouble()
+            "010C" -> s.data.rpm?.toDouble()
+            "TRIM" -> {
+                val a = s.live["0106"]
+                val b = s.live["0107"]
+                if (a == null && b == null) null else (a ?: 0.0) + (b ?: 0.0)
+            }
+            else -> s.live[r.key]
+        }
+    }
+
+    private fun tickAlerts() {
+        val s = _ui.value
+        if (s.alertRules.isEmpty()) return
+        val now = System.currentTimeMillis()
+        for (r in s.alertRules) {
+            if (!r.enabled) continue
+            val v = alertValue(r, s)
+            val hit = v != null && when (r.op) {
+                AlertOp.Above -> v > r.threshold
+                AlertOp.Below -> v < r.threshold
+                AlertOp.AbsAbove -> abs(v) > r.threshold
+            }
+            if (!hit || v == null) {
+                since.remove(r.id)
+                continue
+            }
+            val t0 = since.getOrPut(r.id) { now }
+            if (now - t0 < r.minSeconds * 1000L) continue
+            if (now - (lastFired[r.id] ?: 0L) < r.pauseSeconds * 1000L) continue
+            lastFired[r.id] = now
+            val text = String.format(java.util.Locale.US, "%.1f", v)
+            notifier.fire(r, text)
+            _ui.update { it.copy(alertBanner = "${r.name}: $text") }
         }
     }
 
@@ -259,6 +500,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 adapter = "ELM327 v1.5",
                 ecuId = "\$7E8",
                 trip = Trip(distanceKm = 36.5, seconds = 4320.0, maxSpeed = 110, fuelL = 2.5, fuelKnown = true),
+                supported = Pids.GRAPHABLE.filter { it != "VOLT" }.toSet() + setOf("0101", "0103", "0113", "0141"),
             ),
         )
         job = viewModelScope.launch {
@@ -285,22 +527,67 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                 _ui.update { s ->
                     s.copy(data = d, trip = s.trip.advance(0.05, speed, rpm, FuelModel.fuelRateLph(d, s.profile.displacementL)))
                 }
+                val w = watched
+                if (w.isNotEmpty()) {
+                    val vals = HashMap<String, Double>()
+                    for (key in w) demoValue(key, t, rpm, speed, thr, warm, d)?.let { vals[key] = it }
+                    if (vals.isNotEmpty()) recordSamples(vals)
+                }
+                tickAlerts()
                 t += 0.05
                 delay(50)
             }
         }
     }
 
+    /** Valores de ejemplo para las pantallas de herramientas en modo demo. */
+    private fun demoValue(key: String, t: Double, rpm: Int, speed: Int, thr: Double, warm: Double, d: ObdData): Double? = when (key) {
+        "010C" -> rpm.toDouble()
+        "010D" -> speed.toDouble()
+        "0105" -> d.coolant?.toDouble()
+        "010F" -> 32.0
+        "0104" -> d.load?.toDouble()
+        "0111" -> d.throttle?.toDouble()
+        "0106" -> 2.0 + 1.5 * sin(t * 1.3)
+        "0107" -> 3.5 + 0.4 * sin(t * 0.2)
+        "0108" -> -1.0 + 1.0 * sin(t * 1.1)
+        "0109" -> 2.0
+        "010B" -> 32.0 + thr * 68.0
+        "0110" -> d.maf?.toDouble()
+        "0133" -> 101.0
+        "0142" -> 14.1 + 0.1 * sin(t)
+        "VOLT" -> d.voltage?.toDouble()
+        "0114" -> 0.5 + 0.4 * sin(t * 6.0)
+        "0115" -> 0.6 + 0.03 * sin(t * 2.0)
+        "0124" -> 1.0 + 0.03 * sin(t * 6.0)
+        "013C" -> 300.0 + 280.0 * warm
+        "013E" -> 330.0 + 270.0 * warm
+        "0103" -> 2.0
+        else -> null
+    }
+
     // ------------------------------------------------------------------ códigos de falla
 
+    /** Variables del cuadro congelado que se muestran en la tarjeta. */
+    private val freezeKeys = listOf("010C", "010D", "0105", "0104", "0106", "0107", "010B")
+
     fun readDtcs() {
+        val vid = _ui.value.profile.id
         if (_ui.value.conn == ConnState.Demo) {
             val list = listOf(
-                DtcEntry(DtcDatabase.lookup("P0301"), DtcKind.Stored),
+                DtcEntry(DtcDatabase.lookup("P0171"), DtcKind.Stored),
                 DtcEntry(DtcDatabase.lookup("P0420"), DtcKind.Pending),
             )
+            val ff = FreezeFrame(
+                "P0171",
+                mapOf("010C" to 2150.0, "010D" to 62.0, "0105" to 88.0, "0104" to 41.0, "0106" to 9.4, "0107" to 14.8, "010B" to 52.0),
+            )
+            val rec = dtcStore.observe(vid, list.map { it.info.code }, ff, System.currentTimeMillis())
             _ui.update {
-                it.copy(dtcs = list, dtcsRead = true, mil = true, monitorsReady = 7, monitorsTotal = 8)
+                it.copy(
+                    dtcs = list, dtcsRead = true, mil = true, monitorsReady = 7, monitorsTotal = 8,
+                    freeze = ff, permanent = emptyList(), dtcRecords = rec,
+                )
             }
             return
         }
@@ -314,9 +601,16 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val stored = e.readDtcs("03", "43")
                 val pending = e.readDtcs("07", "47")
+                val permanent = runCatching { e.readPermanentDtcs() }.getOrDefault(emptyList())
                 val status = e.readStatus()
+                val freeze = if (stored.isNotEmpty() || pending.isNotEmpty()) {
+                    runCatching { e.readFreezeFrame(freezeKeys) }.getOrNull()
+                } else {
+                    null
+                }
                 val list = stored.map { DtcEntry(DtcDatabase.lookup(it), DtcKind.Stored) } +
                     pending.filter { it !in stored }.map { DtcEntry(DtcDatabase.lookup(it), DtcKind.Pending) }
+                val rec = dtcStore.observe(vid, list.map { it.info.code } + permanent.filter { it !in stored && it !in pending }, freeze, System.currentTimeMillis())
                 _ui.update {
                     it.copy(
                         dtcs = list,
@@ -325,6 +619,9 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
                         mil = status?.mil,
                         monitorsReady = status?.monitorsReady,
                         monitorsTotal = status?.monitorsTotal,
+                        freeze = freeze,
+                        permanent = permanent,
+                        dtcRecords = rec,
                     )
                 }
             } catch (ex: CancellationException) {
@@ -335,24 +632,107 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Antes de borrar, el cuadro congelado se guarda solo: la ECU lo pierde al limpiar los códigos. */
     fun clearDtcs() {
+        val vid = _ui.value.profile.id
+        val active = _ui.value.dtcs.map { it.info.code }
         if (_ui.value.conn == ConnState.Demo) {
-            _ui.update { it.copy(dtcs = emptyList(), dtcsRead = true, mil = false) }
+            val rec = dtcStore.markCleared(vid, active)
+            _ui.update { it.copy(dtcs = emptyList(), dtcsRead = true, mil = false, freeze = null, dtcRecords = rec) }
             return
         }
         val e = elm ?: return
         viewModelScope.launch {
             _ui.update { it.copy(dtcBusy = true) }
             try {
+                val ff = _ui.value.freeze ?: runCatching { e.readFreezeFrame(freezeKeys) }.getOrNull()
+                if (ff != null || active.isNotEmpty()) dtcStore.observe(vid, active, ff, System.currentTimeMillis())
                 val ok = e.clearDtcs()
-                _ui.update {
-                    if (ok) it.copy(dtcs = emptyList(), dtcsRead = true, dtcBusy = false, mil = false)
-                    else it.copy(dtcBusy = false, message = "La ECU no confirmó el borrado (¿motor encendido?).")
+                if (ok) {
+                    val rec = dtcStore.markCleared(vid, active)
+                    _ui.update { it.copy(dtcs = emptyList(), dtcsRead = true, dtcBusy = false, mil = false, freeze = null, dtcRecords = rec) }
+                } else {
+                    _ui.update { it.copy(dtcBusy = false, message = "La ECU no confirmó el borrado (¿motor encendido?).") }
                 }
             } catch (ex: CancellationException) {
                 throw ex
             } catch (ex: Exception) {
                 _ui.update { it.copy(dtcBusy = false, message = "Error al borrar: ${ex.message}") }
+            }
+        }
+    }
+
+    fun setDtcNote(code: String, note: String) {
+        val rec = dtcStore.update(_ui.value.profile.id, code) { it.copy(note = note) }
+        _ui.update { it.copy(dtcRecords = rec) }
+    }
+
+    fun setDtcRepaired(code: String, repaired: Boolean) {
+        val rec = dtcStore.update(_ui.value.profile.id, code) { it.copy(repaired = repaired) }
+        _ui.update { it.copy(dtcRecords = rec) }
+    }
+
+    /** EXPERIMENTAL: pregunta por códigos a otros módulos. Depende de la marca y del auto. */
+    fun scanModules() {
+        if (_ui.value.modulesBusy) return
+        if (_ui.value.conn == ConnState.Demo) {
+            _ui.update {
+                it.copy(
+                    modules = listOf(
+                        ModuleResult("7E0", "Motor (ECM)", listOf("P0171"), true),
+                        ModuleResult("7E1", "Transmisión (TCM)", emptyList(), true),
+                        ModuleResult("7B0", "ABS / VSA (a probar)", emptyList(), false),
+                    ),
+                )
+            }
+            return
+        }
+        val e = elm
+        if (e == null) {
+            _ui.update { it.copy(message = "Conéctate primero al adaptador.") }
+            return
+        }
+        viewModelScope.launch {
+            _ui.update { it.copy(modulesBusy = true) }
+            paused = true
+            try {
+                val res = e.scanModules(MODULE_CANDIDATES)
+                _ui.update { it.copy(modules = res, modulesBusy = false) }
+            } catch (ex: CancellationException) {
+                throw ex
+            } catch (ex: Exception) {
+                _ui.update { it.copy(modulesBusy = false, message = "La exploración se interrumpió: ${ex.message}") }
+            } finally {
+                paused = false
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ monitores I/M
+
+    fun loadMonitors() {
+        if (_ui.value.monitorsBusy) return
+        if (_ui.value.conn == ConnState.Demo) {
+            val rows = com.rachav.obddash.obd.Monitors.decode(
+                intArrayOf(0x00, 0x07, 0xE5, 0x20), intArrayOf(0x00, 0x07, 0xE5, 0x20),
+            )
+            _ui.update { it.copy(monitors = rows) }
+            return
+        }
+        val e = elm
+        if (e == null) {
+            _ui.update { it.copy(message = "Conéctate primero al adaptador.") }
+            return
+        }
+        viewModelScope.launch {
+            _ui.update { it.copy(monitorsBusy = true) }
+            try {
+                val rows = e.readMonitors()
+                _ui.update { it.copy(monitors = rows, monitorsBusy = false) }
+            } catch (ex: CancellationException) {
+                throw ex
+            } catch (ex: Exception) {
+                _ui.update { it.copy(monitorsBusy = false, message = "No se pudieron leer los monitores: ${ex.message}") }
             }
         }
     }
@@ -364,7 +744,8 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         if (p.id == _ui.value.profile.id) return
         store.setActive(id)
         autoTried = false
-        _ui.update { it.copy(profile = p) }
+        _ui.update { it.copy(profile = p, pendingVin = null) }
+        reloadProfileData()
     }
 
     fun saveProfile(p: VehicleProfile) {
@@ -380,6 +761,7 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         val list = store.all()
         val active = list.firstOrNull { it.id == store.activeId() } ?: list.first()
         _ui.update { it.copy(profiles = list, profile = active) }
+        reloadProfileData()
     }
 
     fun exportProfiles(): String = store.exportJson()
@@ -455,6 +837,137 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         demo = true,
     )
 
+    // ------------------------------------------------------------------ VIN y alta rápida
+
+    private fun saveVin(vin: String) {
+        val p = _ui.value.profile
+        val updated = p.copy(vin = vin)
+        store.save(updated)
+        _ui.update { s -> s.copy(profile = updated, profiles = s.profiles.map { if (it.id == updated.id) updated else it }) }
+    }
+
+    /** Crea un perfil nuevo con el VIN del auto conectado y lo activa. */
+    fun createProfileFromVin() {
+        val vin = _ui.value.pendingVin ?: return
+        val base = _ui.value.profile
+        val np = VehicleProfile(
+            name = "Auto nuevo", displacementL = base.displacementL, fuel = base.fuel, vin = vin,
+            adapterMac = base.adapterMac, adapterName = base.adapterName,
+            distanceUnit = base.distanceUnit, volumeUnit = base.volumeUnit, currency = base.currency,
+        )
+        store.save(np)
+        store.setActive(np.id)
+        _ui.update { it.copy(profiles = store.all(), profile = np, pendingVin = null) }
+        reloadProfileData()
+    }
+
+    fun dismissPendingVin() = _ui.update { it.copy(pendingVin = null) }
+
+    // ------------------------------------------------------------------ variables en vivo
+
+    /**
+     * Las pantallas de herramientas piden qué variables quieren. Con [onlyThese] el ciclo del panel se detiene
+     * y solo se consultan esas (más muestras por segundo); si no, se leen en turnos junto al panel.
+     */
+    fun watch(keys: Set<String>, onlyThese: Boolean = false) {
+        watched = keys
+        exclusive = onlyThese
+    }
+
+    fun unwatch() {
+        watched = emptySet()
+        exclusive = false
+    }
+
+    fun clearSeries() {
+        buffers.clear()
+        liveMap.clear()
+        _ui.update { it.copy(live = emptyMap(), series = emptyMap()) }
+    }
+
+    /** Graba las muestras a un CSV en memoria para compartirlo. */
+    fun setRecording(on: Boolean) {
+        if (on) {
+            csv.setLength(0)
+            csv.append("tiempo_ms,variable,valor\n")
+        }
+        _ui.update { it.copy(recording = on) }
+    }
+
+    fun recordingCsv(): String = csv.toString()
+
+    // ------------------------------------------------------------------ batería
+
+    fun saveBattery(r: BatteryReadings) {
+        val verdict = BatteryEval.evaluate(r).verdict
+        batteryStore.add(_ui.value.profile.id, BatteryRecord(System.currentTimeMillis(), r, verdict))
+        _ui.update { it.copy(batteryHistory = batteryStore.all(it.profile.id)) }
+    }
+
+    // ------------------------------------------------------------------ combustible y tanqueos
+
+    /** Registra un llenado completo y recalcula el factor de corrección del consumo. */
+    fun addFillUp(liters: Double, pricePerL: Double) {
+        val p = _ui.value.profile
+        val factor = TripMath.fuelFactor(liters, accEst)
+        fillStore.add(p.id, FillUp(date = System.currentTimeMillis(), liters = liters, pricePerL = pricePerL, km = accKm, estimatedL = accEst, factor = factor))
+        accKm = 0.0
+        accEst = 0.0
+        fillStore.setAccumulated(p.id, 0.0, 0.0)
+        val all = fillStore.all(p.id)
+        val factors = all.sortedBy { it.date }.mapNotNull { it.factor }
+        val updated = p.copy(fuelCorrection = TripMath.smoothFactor(factors), pricePerL = pricePerL)
+        store.save(updated)
+        _ui.update { s ->
+            s.copy(
+                fillups = all, fuelAcc = 0.0 to 0.0, profile = updated,
+                profiles = s.profiles.map { if (it.id == updated.id) updated else it },
+                message = if (factor == null) "Tanqueo guardado. Faltan más kilómetros medidos para calibrar el consumo." else null,
+            )
+        }
+    }
+
+    fun deleteFillUp(id: String) {
+        val p = _ui.value.profile
+        fillStore.delete(p.id, id)
+        val all = fillStore.all(p.id)
+        val updated = p.copy(fuelCorrection = TripMath.smoothFactor(all.sortedBy { it.date }.mapNotNull { it.factor }))
+        store.save(updated)
+        _ui.update { s -> s.copy(fillups = all, profile = updated, profiles = s.profiles.map { if (it.id == updated.id) updated else it }) }
+    }
+
+    // ------------------------------------------------------------------ alertas
+
+    fun saveAlertRules(rules: List<AlertRule>) {
+        alertStore.save(_ui.value.profile.id, rules)
+        refreshAlertKeys(rules)
+        _ui.update { it.copy(alertRules = rules) }
+    }
+
+    fun resetAlertRules() {
+        val p = _ui.value.profile
+        saveAlertRules(AlertRule.defaults(p.redlineRpm))
+    }
+
+    fun setBackgroundAlerts(on: Boolean) {
+        prefs.backgroundAlerts = on
+        _ui.update { it.copy(backgroundAlerts = on) }
+        val connected = _ui.value.conn == ConnState.Connected
+        if (on && connected) MonitorService.start(getApplication<Application>()) else if (!on) MonitorService.stop(getApplication<Application>())
+    }
+
+    fun setAutostart(on: Boolean) {
+        prefs.autostart = on
+        _ui.update { it.copy(autostart = on) }
+    }
+
+    fun setImTolerance(n: Int) {
+        prefs.imTolerance = n.coerceIn(0, 3)
+        _ui.update { it.copy(imTolerance = prefs.imTolerance) }
+    }
+
+    fun clearAlertBanner() = _ui.update { it.copy(alertBanner = null) }
+
     // ------------------------------------------------------------------ utilidades
 
     fun resetTrip() = _ui.update { it.copy(trip = Trip()) }
@@ -471,9 +984,24 @@ class ObdViewModel(app: Application) : AndroidViewModel(app) {
         job = null
         elm?.close()
         elm = null
+        MonitorService.stop(getApplication<Application>())
     }
 
     override fun onCleared() {
+        fillStore.setAccumulated(_ui.value.profile.id, accKm, accEst)
         stop()
+        notifier.shutdown()
+    }
+
+    private companion object {
+        /** Direcciones CAN de 11 bits a probar. Las de ABS, airbag y carrocería son suposiciones comunes, no un estándar. */
+        val MODULE_CANDIDATES = listOf(
+            "7E0" to "Motor (ECM)",
+            "7E1" to "Transmisión (TCM)",
+            "7B0" to "ABS / VSA (a probar)",
+            "7C0" to "Airbag / SRS (a probar)",
+            "7A0" to "Carrocería / BCM (a probar)",
+            "7D0" to "Tablero (a probar)",
+        )
     }
 }

@@ -131,7 +131,7 @@ private fun CompatResult(r: CompatReport) {
 }
 
 @Composable
-private fun Section(title: String, content: @Composable () -> Unit) {
+internal fun Section(title: String, content: @Composable () -> Unit) {
     Column(
         Modifier
             .fillMaxWidth()
@@ -146,7 +146,7 @@ private fun Section(title: String, content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun KeyValue(label: String, value: String) {
+internal fun KeyValue(label: String, value: String) {
     Row(Modifier.fillMaxWidth()) {
         Text(label, color = Palette.TextDim, fontSize = 14.sp, modifier = Modifier.weight(1f))
         Text(value, color = Palette.Text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
@@ -276,6 +276,9 @@ private fun ProfileEditDialog(initial: VehicleProfile, onDismiss: () -> Unit, on
     var tank by remember { mutableStateOf(initial.tankL?.toString().orEmpty()) }
     var price by remember { mutableStateOf(initial.pricePerL?.toString().orEmpty()) }
     var redline by remember { mutableStateOf(initial.redlineRpm.toString()) }
+    var distUnit by remember { mutableStateOf(initial.distanceUnit) }
+    var volUnit by remember { mutableStateOf(initial.volumeUnit) }
+    var currency by remember { mutableStateOf(initial.currency) }
 
     fun num(s: String): Double? = s.trim().replace(',', '.').toDoubleOrNull()
 
@@ -292,6 +295,13 @@ private fun ProfileEditDialog(initial: VehicleProfile, onDismiss: () -> Unit, on
                 Field("Tanque (L)", tank, number = true) { tank = it }
                 Field("Precio por litro", price, number = true) { price = it }
                 Field("Línea roja (RPM)", redline, number = true) { redline = it }
+                Field("Moneda (símbolo)", currency) { currency = it.take(4) }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Distancia:", fontSize = 14.sp)
+                    OutlinedButton(onClick = { distUnit = if (distUnit == "km") "mi" else "km" }) { Text(distUnit) }
+                    Text("Volumen:", fontSize = 14.sp)
+                    OutlinedButton(onClick = { volUnit = if (volUnit == "L") "gal" else "L" }) { Text(volUnit) }
+                }
             }
         },
         confirmButton = {
@@ -308,6 +318,9 @@ private fun ProfileEditDialog(initial: VehicleProfile, onDismiss: () -> Unit, on
                             tankL = num(tank)?.takeIf { it > 0 },
                             pricePerL = num(price)?.takeIf { it > 0 },
                             redlineRpm = redline.trim().toIntOrNull()?.takeIf { it in 2000..12000 } ?: initial.redlineRpm,
+                            distanceUnit = distUnit,
+                            volumeUnit = volUnit,
+                            currency = currency.trim().ifBlank { "$" },
                         ),
                     )
                 },
@@ -318,7 +331,7 @@ private fun ProfileEditDialog(initial: VehicleProfile, onDismiss: () -> Unit, on
 }
 
 @Composable
-private fun Field(label: String, value: String, number: Boolean = false, onChange: (String) -> Unit) {
+internal fun Field(label: String, value: String, number: Boolean = false, onChange: (String) -> Unit) {
     OutlinedTextField(
         value = value,
         onValueChange = onChange,

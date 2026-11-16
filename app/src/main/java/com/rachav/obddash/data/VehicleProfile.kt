@@ -22,6 +22,13 @@ data class VehicleProfile(
     val adapterName: String? = null,
     val vin: String? = null,
     val redlineRpm: Int = 6800,
+    /** "km" o "mi" para distancias en las pantallas de viaje y costo. */
+    val distanceUnit: String = "km",
+    /** "L" o "gal". */
+    val volumeUnit: String = "L",
+    val currency: String = "$",
+    /** Litros reales entre litros estimados, calculado con los tanqueos. 1.0 = sin corrección. */
+    val fuelCorrection: Double = 1.0,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -37,6 +44,10 @@ data class VehicleProfile(
         adapterName?.let { put("adapterName", it) }
         vin?.let { put("vin", it) }
         put("redlineRpm", redlineRpm)
+        put("distanceUnit", distanceUnit)
+        put("volumeUnit", volumeUnit)
+        put("currency", currency)
+        put("fuelCorrection", fuelCorrection)
     }
 
     companion object {
@@ -56,6 +67,10 @@ data class VehicleProfile(
                 adapterName = o.optString("adapterName").ifBlank { null },
                 vin = o.optString("vin").ifBlank { null },
                 redlineRpm = o.optInt("redlineRpm", d.redlineRpm).takeIf { it > 0 } ?: d.redlineRpm,
+                distanceUnit = o.optString("distanceUnit", d.distanceUnit).takeIf { it == "km" || it == "mi" } ?: d.distanceUnit,
+                volumeUnit = o.optString("volumeUnit", d.volumeUnit).takeIf { it == "L" || it == "gal" } ?: d.volumeUnit,
+                currency = o.optString("currency", d.currency).ifBlank { d.currency },
+                fuelCorrection = o.optDouble("fuelCorrection", 1.0).takeIf { it in 0.5..2.0 } ?: 1.0,
             )
         }
 

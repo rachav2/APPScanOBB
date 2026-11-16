@@ -30,6 +30,13 @@ class MainActivity : ComponentActivity() {
             btGranted = granted
         }
 
+    private val notifLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* sin permiso, solo se pierden las notificaciones */ }
+
+    private fun requestNotifications() {
+        if (Build.VERSION.SDK_INT >= 33) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -43,6 +50,7 @@ class MainActivity : ComponentActivity() {
                     btGranted = btGranted,
                     onRequestBt = ::requestBt,
                     bondedDevices = ::bondedDevices,
+                    onRequestNotifications = ::requestNotifications,
                 )
             }
         }
