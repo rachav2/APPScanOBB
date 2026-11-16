@@ -65,6 +65,33 @@ enum class Tab(val label: String, val icon: Ico) {
     Mas("Más", Ico.Grid),
 }
 
+enum class MasTool(val label: String) {
+    Conexion("Conexión"),
+    Perfiles("Perfiles"),
+    Compat("Compatibilidad"),
+}
+
+@Composable
+private fun ToolSwitcher(selected: MasTool, onSelect: (MasTool) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        MasTool.values().forEach { t ->
+            val sel = t == selected
+            Box(
+                Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(if (sel) Color(0xFF1E5BD8) else Palette.Surface2)
+                    .clickable { onSelect(t) }
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+            ) {
+                Text(t.label, color = if (sel) Color.White else Palette.TextDim, fontSize = 14.sp)
+            }
+        }
+    }
+}
+
 @Composable
 fun ObdApp(
     vm: ObdViewModel,
@@ -74,6 +101,12 @@ fun ObdApp(
 ) {
     val state by vm.ui.collectAsState()
     var tab by rememberSaveable { mutableStateOf(Tab.Mas) }
+    var tool by rememberSaveable { mutableStateOf(MasTool.Conexion) }
+
+    // Conexión automática con el adaptador del perfil activo (una vez por perfil).
+    LaunchedEffect(btGranted, state.profile.id) {
+        if (btGranted) vm.autoConnect(bondedDevices)
+    }
 
     LaunchedEffect(state.conn) {
         if (state.conn == ConnState.Connected || state.conn == ConnState.Demo) tab = Tab.Panel
@@ -84,7 +117,11 @@ fun ObdApp(
         Tab.Temp -> "Temperaturas"
         Tab.Velocidad -> "Velocidad y Viaje"
         Tab.Errores -> "Códigos de Error"
-        Tab.Mas -> "Conexión"
+        Tab.Mas -> when (tool) {
+            MasTool.Conexion -> "Conexión"
+            MasTool.Perfiles -> "Perfiles"
+            MasTool.Compat -> "Compatibilidad"
+        }
     }
     val subtitle = if (tab == Tab.Panel) {
         when (state.conn) {
@@ -105,15 +142,31 @@ fun ObdApp(
                 Tab.Temp -> TempScreen(state)
                 Tab.Velocidad -> SpeedScreen(state, onReset = vm::resetTrip)
                 Tab.Errores -> DtcScreen(state, onRead = vm::readDtcs, onClear = vm::clearDtcs)
-                Tab.Mas -> ConnectionScreen(
-                    state = state,
-                    btGranted = btGranted,
-                    onRequestBt = onRequestBt,
-                    bondedDevices = bondedDevices,
-                    onConnect = vm::connect,
-                    onDemo = vm::startDemo,
-                    onDisconnect = vm::disconnect,
-                )
+                Tab.Mas -> Column(Modifier.fillMaxSize()) {
+                    ToolSwitcher(tool, onSelect = { tool = it })
+                    Box(Modifier.weight(1f).fillMaxWidth()) {
+                        when (tool) {
+                            MasTool.Conexion -> ConnectionScreen(
+                                state = state,
+                                btGranted = btGranted,
+                                onRequestBt = onRequestBt,
+                                bondedDevices = bondedDevices,
+                                onConnect = vm::connect,
+                                onDemo = vm::startDemo,
+                                onDisconnect = vm::disconnect,
+                            )
+                            MasTool.Perfiles -> ProfilesScreen(
+                                state = state,
+                                onSelect = vm::selectProfile,
+                                onSave = vm::saveProfile,
+                                onDelete = vm::deleteProfile,
+                                onExport = vm::exportProfiles,
+                                onImport = vm::importProfiles,
+                            )
+                            MasTool.Compat -> CompatScreen(state, onRun = vm::runCompat)
+                        }
+                    }
+                }
             }
             state.message?.let {
                 MessageBanner(it, vm::clearMessage, Modifier.align(Alignment.BottomCenter))
@@ -307,7 +360,7 @@ private fun TripStrip(state: UiState, modifier: Modifier = Modifier) {
     ) {
         StripItem(Ico.Road, "Distancia Trip", fmtD(t.distanceKm, 1) + " km", Modifier.weight(1f))
         Text(
-            text = AppConfig.CAR_NAME,
+            text = state.profile.name.uppercase(),
             style = TextStyle(
                 brush = Brush.verticalGradient(listOf(Color.White, Color(0xFF7D8DB0))),
                 fontSize = 30.sp,

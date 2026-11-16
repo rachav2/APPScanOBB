@@ -11,13 +11,14 @@ package com.rachav.obddash.obd
  * [VOLUMETRIC_EFFICIENCY] si el consumo promedio no coincide con lo que ves en las gasolineras.
  */
 object FuelModel {
+    /** Cilindrada por defecto; cada perfil de vehículo trae la suya. */
     const val DISPLACEMENT_L = 1.8
     const val VOLUMETRIC_EFFICIENCY = 0.82
     private const val AFR = 14.7
     private const val GASOLINE_G_PER_L = 745.0
 
     /** Flujo de aire en g/s, o null si faltan datos. */
-    fun airflowGs(d: ObdData): Double? {
+    fun airflowGs(d: ObdData, displacementL: Double = DISPLACEMENT_L): Double? {
         d.maf?.let { return it.toDouble() }
         val map = d.map ?: return null
         val rpm = d.rpm ?: return null
@@ -25,9 +26,10 @@ object FuelModel {
         if (rpm <= 0) return 0.0
         val iatK = iatC + 273.15
         val imap = rpm * map / iatK
-        return imap / 120.0 * VOLUMETRIC_EFFICIENCY * DISPLACEMENT_L * 28.97 / 8.314
+        return imap / 120.0 * VOLUMETRIC_EFFICIENCY * displacementL * 28.97 / 8.314
     }
 
     /** Consumo instantáneo en litros por hora. */
-    fun fuelRateLph(d: ObdData): Double? = airflowGs(d)?.let { it / AFR / GASOLINE_G_PER_L * 3600.0 }
+    fun fuelRateLph(d: ObdData, displacementL: Double = DISPLACEMENT_L): Double? =
+        airflowGs(d, displacementL)?.let { it / AFR / GASOLINE_G_PER_L * 3600.0 }
 }

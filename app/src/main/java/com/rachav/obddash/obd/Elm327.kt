@@ -207,6 +207,79 @@ class Elm327 {
         return out.toList()
     }
 
+    /** Protocolo que el adaptador negoció con el auto (ATDPN), ya con nombre legible. */
+    suspend fun readProtocol(): String? {
+        val raw = lines(send("ATDPN")).firstOrNull() ?: return null
+        val code = raw.removePrefix("A")
+        return when (code) {
+            "1" -> "SAE J1850 PWM"
+            "2" -> "SAE J1850 VPW"
+            "3" -> "ISO 9141-2"
+            "4" -> "ISO 14230-4 KWP (inicio lento)"
+            "5" -> "ISO 14230-4 KWP (inicio rápido)"
+            "6" -> "ISO 15765-4 CAN 11 bits / 500 kbps"
+            "7" -> "ISO 15765-4 CAN 29 bits / 500 kbps"
+            "8" -> "ISO 15765-4 CAN 11 bits / 250 kbps"
+            "9" -> "ISO 15765-4 CAN 29 bits / 250 kbps"
+            else -> raw
+        }
+    }
+
+    /** VIN (modo 09, PID 02). Null si el auto no lo entrega. */
+    suspend fun readVin(): String? {
+        val raw = lines(send("0902", 6000L))
+        val indexed = Regex("^[0-9A-F]:")
+        val hex = if (raw.any { indexed.containsMatchIn(it) }) {
+            // CAN multitrama: "0:490201...", "1:...". Tras "4902" va el contador de bloques.
+            raw.filter { indexed.containsMatchIn(it) }.joinToString("") { it.substring(2) }
+                .removePrefix("4902").drop(2)
+        } else {
+            // Otros protocolos: una línea por bloque, "4902" + número de bloque + 4 bytes.
+            raw.filter { it.startsWith("4902") }.joinToString("") { it.drop(6) }
+        }
+        val text = hex.chunked(2).mapNotNull { it.toIntOrNull(16) }
+            .map { it.toChar() }
+            .filter { it in 'A'..'Z' || it in '0'..'9' }
+            .joinToString("")
+        return if (text.length >= 17) text.take(17) else null
+    }
+
+    /** Pregunta si la ECU responde a un servicio. [request] es el comando y [prefix] el inicio de una respuesta válida. */
+    suspend fun respondsTo(request: String, prefix: String): Boolean {
+        val raw = lines(send(request, 4000L))
+        val indexed = Regex("^[0-9A-F]:")
+        return raw.any { it.startsWith(prefix) } ||
+            raw.any { indexed.containsMatchIn(it) && it.substring(2).startsWith(prefix) }
+    }
+
+    /** Recorre los servicios y datos clave y arma el reporte de compatibilidad. */
+    suspend fun probe(supported: Set<String>): CompatReport {
+        val modes = listOf(
+            ModeSupport("01", "Datos en vivo", supported.isNotEmpty()),
+            ModeSupport("02", "Cuadro congelado", respondsTo("020000", "4200")),
+            ModeSupport("03", "Códigos almacenados", respondsTo("03", "43")),
+            ModeSupport("06", "Pruebas de monitores", respondsTo("0600", "4600")),
+            ModeSupport("07", "Códigos pendientes", respondsTo("07", "47")),
+            ModeSupport("09", "Información del vehículo", respondsTo("0900", "4900")),
+            ModeSupport("0A", "Códigos permanentes", respondsTo("0A", "4A")),
+        )
+        val ecuVolt = if ("0142" in supported) {
+            readPid("0142")?.takeIf { it.size >= 2 }?.let { (it[0] * 256 + it[1]) / 1000f }
+        } else {
+            null
+        }
+        return CompatReport(
+            adapter = version.takeIf { it.isNotBlank() },
+            protocol = readProtocol(),
+            ecuId = ecuId,
+            vin = readVin(),
+            voltageAdapter = readVoltage(),
+            voltagePid = ecuVolt,
+            supportedPids = supported.sorted(),
+            modes = modes,
+        )
+    }
+
     /** Borra códigos y apaga la luz MIL (modo 04). */
     suspend fun clearDtcs(): Boolean = lines(send("04", 5000L)).any { it.startsWith("44") }
 
