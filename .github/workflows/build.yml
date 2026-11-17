@@ -44,6 +44,16 @@ jobs:
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
 
+      - name: Publicar APK como Release (cada compilación en main)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: OBD Dash build ${{ github.run_number }}
+          prerelease: true
+          files: app/build/outputs/apk/debug/*.apk
+
       - name: Publicar Release (solo con tags v*)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
