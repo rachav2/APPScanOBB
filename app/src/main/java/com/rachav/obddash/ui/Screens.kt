@@ -5,6 +5,7 @@ import android.bluetooth.BluetoothDevice
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -65,15 +66,59 @@ enum class Tab(val label: String, val icon: Ico) {
     Mas("Más", Ico.Grid),
 }
 
+enum class MasTool(val label: String) {
+    Conexion("Conexión"),
+    Perfiles("Perfiles"),
+    Compat("Compatibilidad"),
+    Graficas("Gráficas"),
+    Trims("Fuel trims"),
+    Oxigeno("Oxígeno y cat."),
+    Aire("MAP / MAF"),
+    Bateria("Batería"),
+    Monitores("Monitores"),
+    Costo("Costo"),
+    Tanqueos("Tanqueos"),
+    Reportes("Reportes"),
+    Alertas("Alertas"),
+}
+
+@Composable
+private fun ToolSwitcher(selected: MasTool, onSelect: (MasTool) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        MasTool.values().forEach { t ->
+            val sel = t == selected
+            Box(
+                Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(if (sel) Color(0xFF1E5BD8) else Palette.Surface2)
+                    .clickable { onSelect(t) }
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+            ) {
+                Text(t.label, color = if (sel) Color.White else Palette.TextDim, fontSize = 14.sp)
+            }
+        }
+    }
+}
+
 @Composable
 fun ObdApp(
     vm: ObdViewModel,
     btGranted: Boolean,
     onRequestBt: () -> Unit,
     bondedDevices: () -> List<BluetoothDevice>,
+    onRequestNotifications: () -> Unit = {},
 ) {
     val state by vm.ui.collectAsState()
     var tab by rememberSaveable { mutableStateOf(Tab.Mas) }
+    var tool by rememberSaveable { mutableStateOf(MasTool.Conexion) }
+
+    // Conexión automática con el adaptador del perfil activo (una vez por perfil).
+    LaunchedEffect(btGranted, state.profile.id) {
+        if (btGranted) vm.autoConnect(bondedDevices)
+    }
 
     LaunchedEffect(state.conn) {
         if (state.conn == ConnState.Connected || state.conn == ConnState.Demo) tab = Tab.Panel
@@ -84,7 +129,7 @@ fun ObdApp(
         Tab.Temp -> "Temperaturas"
         Tab.Velocidad -> "Velocidad y Viaje"
         Tab.Errores -> "Códigos de Error"
-        Tab.Mas -> "Conexión"
+        Tab.Mas -> tool.label
     }
     val subtitle = if (tab == Tab.Panel) {
         when (state.conn) {
@@ -104,22 +149,74 @@ fun ObdApp(
                 Tab.Panel -> PanelScreen(state)
                 Tab.Temp -> TempScreen(state)
                 Tab.Velocidad -> SpeedScreen(state, onReset = vm::resetTrip)
-                Tab.Errores -> DtcScreen(state, onRead = vm::readDtcs, onClear = vm::clearDtcs)
-                Tab.Mas -> ConnectionScreen(
+                Tab.Errores -> DtcScreen(
                     state = state,
-                    btGranted = btGranted,
-                    onRequestBt = onRequestBt,
-                    bondedDevices = bondedDevices,
-                    onConnect = vm::connect,
-                    onDemo = vm::startDemo,
-                    onDisconnect = vm::disconnect,
+                    vm = vm,
+                    onOpenRelated = { r ->
+                        tool = when (r) {
+                            "trims" -> MasTool.Trims
+                            "o2" -> MasTool.Oxigeno
+                            "map" -> MasTool.Aire
+                            else -> MasTool.Bateria
+                        }
+                        tab = Tab.Mas
+                    },
                 )
+                Tab.Mas -> Column(Modifier.fillMaxSize()) {
+                    ToolSwitcher(tool, onSelect = { tool = it })
+                    Box(Modifier.weight(1f).fillMaxWidth()) {
+                        when (tool) {
+                            MasTool.Conexion -> ConnectionScreen(
+                                state = state,
+                                btGranted = btGranted,
+                                onRequestBt = onRequestBt,
+                                bondedDevices = bondedDevices,
+                                onConnect = vm::connect,
+                                onDemo = vm::startDemo,
+                                onDisconnect = vm::disconnect,
+                            )
+                            MasTool.Perfiles -> ProfilesScreen(
+                                state = state,
+                                onSelect = vm::selectProfile,
+                                onSave = vm::saveProfile,
+                                onDelete = vm::deleteProfile,
+                                onExport = vm::exportProfiles,
+                                onImport = vm::importProfiles,
+                            )
+                            MasTool.Compat -> CompatScreen(state, onRun = vm::runCompat)
+                            MasTool.Graficas -> GraphScreen(state, vm)
+                            MasTool.Trims -> TrimsScreen(state, vm)
+                            MasTool.Oxigeno -> OxygenScreen(state, vm)
+                            MasTool.Aire -> AirScreen(state, vm)
+                            MasTool.Bateria -> BatteryScreen(state, vm)
+                            MasTool.Monitores -> MonitorsScreen(state, vm)
+                            MasTool.Costo -> CostScreen(state)
+                            MasTool.Tanqueos -> FillUpScreen(state, vm)
+                            MasTool.Reportes -> ReportsScreen(state)
+                            MasTool.Alertas -> AlertsScreen(state, vm, onRequestNotifications)
+                        }
+                    }
+                }
             }
             state.message?.let {
                 MessageBanner(it, vm::clearMessage, Modifier.align(Alignment.BottomCenter))
             }
+            state.alertBanner?.let {
+                MessageBanner("⚠ $it", vm::clearAlertBanner, Modifier.align(Alignment.TopCenter))
+            }
         }
         BottomNav(selected = tab, onSelect = { tab = it }, hasDtc = state.dtcs.isNotEmpty())
+    }
+
+    // Alta rápida: el VIN leído no coincide con el perfil activo.
+    state.pendingVin?.let { vin ->
+        AlertDialog(
+            onDismissRequest = vm::dismissPendingVin,
+            title = { Text("¿Es otro auto?") },
+            text = { Text("El VIN que entrega este auto ($vin) no coincide con el del perfil \"${state.profile.name}\". ¿Quieres crear un perfil nuevo con ese VIN?") },
+            confirmButton = { TextButton(onClick = vm::createProfileFromVin) { Text("Crear perfil") } },
+            dismissButton = { TextButton(onClick = vm::dismissPendingVin) { Text("No") } },
+        )
     }
 }
 
@@ -307,7 +404,7 @@ private fun TripStrip(state: UiState, modifier: Modifier = Modifier) {
     ) {
         StripItem(Ico.Road, "Distancia Trip", fmtD(t.distanceKm, 1) + " km", Modifier.weight(1f))
         Text(
-            text = AppConfig.CAR_NAME,
+            text = state.profile.name.uppercase(),
             style = TextStyle(
                 brush = Brush.verticalGradient(listOf(Color.White, Color(0xFF7D8DB0))),
                 fontSize = 30.sp,
@@ -442,150 +539,6 @@ fun SpeedScreen(state: UiState, onReset: () -> Unit) {
 }
 
 // ============================================================================ FALLAS
-
-@Composable
-fun DtcScreen(state: UiState, onRead: () -> Unit, onClear: () -> Unit) {
-    var confirm by rememberSaveable { mutableStateOf(false) }
-    val connected = state.conn == ConnState.Connected || state.conn == ConnState.Demo
-    val count = state.dtcs.size
-    val iconColor = when {
-        !state.dtcsRead -> Palette.TextDim
-        count == 0 -> Palette.Green
-        else -> Palette.Red
-    }
-    val headline = when {
-        !state.dtcsRead -> "Sin lectura"
-        count == 0 -> "Sin códigos de error"
-        count == 1 -> "1 Código de Error"
-        else -> "$count Códigos de Error"
-    }
-
-    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            ObdIcon(
-                if (state.dtcsRead && count == 0) Ico.Check else Ico.Warning,
-                Modifier.size(72.dp),
-                iconColor,
-            )
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(headline, color = iconColor, fontSize = 24.sp, fontWeight = FontWeight.Bold)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Button(onClick = onRead, enabled = connected && !state.dtcBusy) { Text("Leer códigos") }
-                    OutlinedButton(
-                        onClick = { confirm = true },
-                        enabled = connected && !state.dtcBusy && count > 0,
-                    ) { Text("Borrar DTC") }
-                }
-            }
-        }
-        if (state.dtcBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
-
-        Box(Modifier.weight(1f).fillMaxWidth()) {
-            when {
-                !connected -> Hint("Conéctate al adaptador (o usa el modo demo) para leer los códigos de falla.")
-                !state.dtcsRead -> Hint("Pulsa \"Leer códigos\" para consultar la ECU.")
-                count == 0 -> Hint("La ECU no reporta fallas almacenadas ni pendientes.")
-                else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    items(state.dtcs) { DtcCard(it) }
-                }
-            }
-        }
-
-        val total = state.monitorsTotal
-        if (state.dtcsRead && total != null) {
-            Text("Estado del Sistema", color = Palette.TextDim, fontSize = 14.sp)
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(Palette.CardBottom)
-                    .padding(14.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                val allReady = state.monitorsReady == total
-                ObdIcon(Ico.Check, Modifier.size(26.dp), if (allReady) Palette.Green else Palette.Amber)
-                Text(
-                    "Monitores: ${state.monitorsReady ?: 0} / $total",
-                    color = Palette.Text,
-                    fontSize = 18.sp,
-                    modifier = Modifier.weight(1f),
-                )
-                state.mil?.let { on ->
-                    Text(
-                        if (on) "Check engine: ENCENDIDA" else "Check engine: apagada",
-                        color = if (on) Palette.Amber else Palette.Green,
-                        fontSize = 13.sp,
-                    )
-                }
-            }
-        }
-    }
-
-    if (confirm) {
-        AlertDialog(
-            onDismissRequest = { confirm = false },
-            title = { Text("¿Borrar códigos de falla?") },
-            text = {
-                Text(
-                    "Se apagará la luz de check engine y se perderán los datos de congelamiento. " +
-                        "Si la falla persiste, el código volverá a aparecer.",
-                )
-            },
-            confirmButton = { TextButton(onClick = { confirm = false; onClear() }) { Text("Borrar") } },
-            dismissButton = { TextButton(onClick = { confirm = false }) { Text("Cancelar") } },
-        )
-    }
-}
-
-@Composable
-private fun Hint(text: String) {
-    Text(text, color = Palette.TextDim, fontSize = 16.sp, modifier = Modifier.padding(vertical = 16.dp))
-}
-
-@Composable
-private fun DtcCard(entry: DtcEntry) {
-    val info = entry.info
-    val accent = if (entry.kind == DtcKind.Stored) Palette.Red else Palette.Amber
-    val shape = RoundedCornerShape(14.dp)
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clip(shape)
-            .background(Brush.linearGradient(listOf(Palette.CardTop, Palette.CardBottom)))
-            .border(1.dp, accent.copy(alpha = 0.5f), shape)
-            .padding(14.dp),
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Box(
-                Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .border(1.dp, Palette.Blue, RoundedCornerShape(8.dp))
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-            ) {
-                Text(info.code, color = Palette.Text, fontSize = 22.sp, fontWeight = FontWeight.Bold)
-            }
-            Spacer(Modifier.height(4.dp))
-            Text(
-                if (entry.kind == DtcKind.Stored) "ALMACENADO" else "PENDIENTE",
-                color = accent,
-                fontSize = 10.sp,
-                letterSpacing = 1.sp,
-            )
-        }
-        Column(Modifier.weight(1f)) {
-            Text(info.description, color = Palette.Text, fontSize = 16.sp)
-            Spacer(Modifier.height(4.dp))
-            Text(
-                info.system + " · " + if (info.generic) "Genérico" else "Fabricante",
-                color = Palette.TextDim,
-                fontSize = 12.sp,
-            )
-        }
-    }
-}
 
 // ============================================================================ CONEXIÓN
 
